@@ -128,7 +128,7 @@ def main():
         axes[1, i].axis('off')
         axes[1, i].set_title(f"Sample {i+1} Reconstructed")
         
-    plt.suptitle("ANN VAE Fashion-MNIST Reconstruction Quality (3 Test Samples)", fontsize=12, weight='bold', pad=10)
+    plt.suptitle("ANN VAE Fashion-MNIST Reconstruction Quality (3 Test Samples)", fontsize=12, weight='bold')
     fig_path = os.path.join(plot_dir, 'fashion_vae_train_result.png')
     plt.savefig(fig_path, dpi=150, bbox_inches='tight')
     print(f"[Success] Reconstruction comparative plot saved to: {fig_path}\n")
