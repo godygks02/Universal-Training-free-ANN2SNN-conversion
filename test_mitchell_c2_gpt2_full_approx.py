@@ -353,7 +353,7 @@ class SPLALayerNorm(nn.Module):
         dim = -1
         n = x.shape[dim]
         original_shape = x.shape
-        x_flat = x.view(-1, n)
+        x_flat = x.reshape(-1, n)
         
         mu = x_flat.mean(dim=dim, keepdim=True)
         centered = x_flat - mu
@@ -378,7 +378,7 @@ class SPLALayerNorm(nn.Module):
             self.num_elements += x_flat.numel()
             self.num_samples += x_flat.shape[0]
             
-        out_reshaped = out.view(original_shape)
+        out_reshaped = out.reshape(original_shape)
         return out_reshaped * self.weight + self.bias
 
 

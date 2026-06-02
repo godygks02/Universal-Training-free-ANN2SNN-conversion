@@ -87,8 +87,8 @@ class MitchellC2Conv1D(nn.Module):
         x_flat = x.view(-1, self.nx) # [N, nx]
         N = x_flat.shape[0]
         
-        chunk_size_n = 256
-        chunk_size_f = 256
+        chunk_size_n = 64
+        chunk_size_f = 64
         out_flat = torch.empty(N, self.nf, device=x.device, dtype=x.dtype)
         
         for n_start in range(0, N, chunk_size_n):
@@ -148,8 +148,8 @@ class MitchellC2Linear(nn.Module):
         N = x_flat.shape[0]
         
         # 2D chunking parameters to prevent OOM
-        chunk_size_n = 128
-        chunk_size_f = 128
+        chunk_size_n = 64
+        chunk_size_f = 64
         out_flat = torch.empty(N, self.out_features, device=x.device, dtype=x.dtype)
         
         for n_start in range(0, N, chunk_size_n):
@@ -187,7 +187,7 @@ def mitchell_c2_matmul_qk(q, k_t, lut):
     B, H, S, D = q.shape
     key_len = k_t.shape[-1]
     out = torch.empty(B, H, S, key_len, device=q.device, dtype=q.dtype)
-    chunk_size = 64
+    chunk_size = 32
     for i in range(0, S, chunk_size):
         i_end = min(i + chunk_size, S)
         q_chunk = q[:, :, i:i_end, :].unsqueeze(3) # [B, H, chunk_size, 1, D]
@@ -207,7 +207,7 @@ def mitchell_c2_matmul_av(attn_weights, v, lut):
     B, H, S, key_len = attn_weights.shape
     D = v.shape[-1]
     out = torch.empty(B, H, S, D, device=attn_weights.device, dtype=attn_weights.dtype)
-    chunk_size = 64
+    chunk_size = 32
     for i in range(0, S, chunk_size):
         i_end = min(i + chunk_size, S)
         w_chunk = attn_weights[:, :, i:i_end, :].unsqueeze(4) # [B, H, chunk_size, key_len, 1]
