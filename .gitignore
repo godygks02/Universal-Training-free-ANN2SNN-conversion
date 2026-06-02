@@ -5,10 +5,10 @@ __pycache__/
 
 # Large local files (Datasets and Checkpoint Weights)
 data/
-test_model/*.pth
+# test_model/*.pth
 
 # Visual report plots (Can be generated locally)
-plots/mitchell_c2_snn/
+# plots/mitchell_c2_snn/
 
 # Operating system files
 .DS_Store
