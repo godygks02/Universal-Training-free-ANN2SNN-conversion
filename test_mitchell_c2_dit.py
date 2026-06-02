@@ -349,7 +349,7 @@ def calibrate_dit(model, inputs_list, device):
         def hook(module, input, output):
             val = input[0].detach()
             val_abs = val.abs()
-            val_flat = val_abs.view(-1).float()
+            val_flat = val_abs.reshape(-1).float()
             if val_flat.numel() > 1000000:
                 stride = val_flat.numel() // 1000000
                 val_flat = val_flat[::stride][:1000000]
@@ -677,7 +677,7 @@ def main():
         t_start = time.time()
         for t in tqdm(scheduler.timesteps, desc="ANN Denoising"):
             with torch.no_grad():
-                model_output = model_ann(latents_ann, timestep=t, class_labels=class_labels).sample
+                model_output = model_ann(latents_ann, timestep=t.reshape(-1).to(device), class_labels=class_labels).sample
                 noise_pred = model_output[:, :4]
                 latents_ann = scheduler.step(noise_pred, t, latents_ann).prev_sample
         time_ann = time.time() - t_start
@@ -685,7 +685,7 @@ def main():
         t_start = time.time()
         for t in tqdm(scheduler.timesteps, desc="SNN Denoising"):
             with torch.no_grad():
-                model_output = model_snn(latents_snn, timestep=t, class_labels=class_labels).sample
+                model_output = model_snn(latents_snn, timestep=t.reshape(-1).to(device), class_labels=class_labels).sample
                 noise_pred = model_output[:, :4]
                 latents_snn = scheduler.step(noise_pred, t, latents_snn).prev_sample
         time_snn = time.time() - t_start

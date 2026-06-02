@@ -9,7 +9,7 @@ data/
 
 
 # Visual report plots (Can be generated locally)
-# plots/mitchell_c2_snn/
+plots/mitchell_c2_snn/
 
 # Operating system files
 .DS_Store
