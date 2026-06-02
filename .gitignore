@@ -1,0 +1,20 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large local files (Datasets and Checkpoint Weights)
+data/
+test_model/*.pth
+
+# Visual report plots (Can be generated locally)
+plots/mitchell_c2_snn/
+
+# Operating system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
