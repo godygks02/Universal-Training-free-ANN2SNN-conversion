@@ -618,7 +618,7 @@ def main():
         axes[2, i].axis('off')
         if i == 0: axes[2, i].set_title(f"SNN (T={args.timesteps}) Reconstructed", loc='left', weight='bold')
         
-    plt.suptitle("Fashion-MNIST VAE Image Reconstruction: Original vs. ANN vs. Spiking SNN", fontsize=14, weight='bold', pad=15)
+    plt.suptitle("Fashion-MNIST VAE Image Reconstruction: Original vs. ANN vs. Spiking SNN", fontsize=14, weight='bold')
     recon_plot_path = os.path.join(plot_dir, "vae_reconstruction_report.png")
     plt.savefig(recon_plot_path, dpi=150, bbox_inches='tight')
     print(f"  [Success] Reconstruction comparative report saved to: {recon_plot_path}")
@@ -643,7 +643,7 @@ def main():
         axes[1, i].axis('off')
         if i == 0: axes[1, i].set_title(f"SNN (T={args.timesteps}) Generated", loc='left', weight='bold')
         
-    plt.suptitle("Generative Test: Brand New Fashion-MNIST Images generated from latent noise z ~ N(0, I)", fontsize=14, weight='bold', pad=15)
+    plt.suptitle("Generative Test: Brand New Fashion-MNIST Images generated from latent noise z ~ N(0, I)", fontsize=14, weight='bold')
     gen_plot_path = os.path.join(plot_dir, "vae_generation_report.png")
     plt.savefig(gen_plot_path, dpi=150, bbox_inches='tight')
     print(f"  [Success] Generative comparative report saved to: {gen_plot_path}")

@@ -7,6 +7,7 @@ __pycache__/
 data/
 # test_model/*.pth
 
+
 # Visual report plots (Can be generated locally)
 # plots/mitchell_c2_snn/
 
