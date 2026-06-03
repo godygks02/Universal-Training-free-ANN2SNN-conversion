@@ -26,7 +26,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 # Import modularized components
-from modules.IEEE_754_based_Encoding import ExponentGuidedBitSliceEncoder
+from modules.IEEE_754_based_Encoding import IEEE754_based_encoder
 import importlib
 mitchell_c2_approx = importlib.import_module("modules.mitchell_c-2_approx")
 spla_module = importlib.import_module("modules.S-PLA")
@@ -35,146 +35,15 @@ decompose_float32 = mitchell_c2_approx.decompose_float32
 mitchell_c2_multiply = mitchell_c2_approx.mitchell_c2_multiply
 MitchellC2Linear = mitchell_c2_approx.MitchellC2Linear
 SBTSPLAActivation = spla_module.SBTSPLAActivation
+SPLALayerNorm = spla_module.SPLALayerNorm
+SPLAActivationWrapper = spla_module.SPLAActivationWrapper
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. High-Fidelity S-PLA LayerNorm and GELU Activations
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fp_decompose_even_exp(v: torch.Tensor):
-    """Decomposes positive v into M_adj * 2^E_adj where E_adj is always even."""
-    v_safe = v.abs().clamp(min=1e-38)
-    E_raw  = torch.floor(torch.log2(v_safe))
-    M_raw  = v_safe / torch.pow(2.0, E_raw)
-    is_odd = (E_raw % 2).abs() > 0.5
-    E_adj  = torch.where(is_odd, E_raw - 1, E_raw)
-    M_adj  = torch.where(is_odd, M_raw * 2.0, M_raw)
-    return M_adj, E_adj
-
-
-class SPLALayerNorm(nn.Module):
-    """
-    Hybrid S-PLA + Mitchell C-2 LayerNorm.
-    """
-    def __init__(self, normalized_shape, eps=1e-5, s_val=3.0, timesteps=16):
-        super().__init__()
-        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else normalized_shape
-        self.eps = eps
-        self.s_val = s_val
-        self.timesteps = timesteps
-        
-        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
-        
-        self.proposed_encoder = ExponentGuidedBitSliceEncoder(timesteps=timesteps, s=math.ceil(math.log2(s_val)))
-        
-        lut_data = torch.tensor([
-            [0.0156, 0.0469, 0.0781, 0.1094],
-            [0.0469, 0.1406, 0.2344, 0.3281],
-            [0.0781, 0.2344, 0.3906, 0.5469],
-            [0.1094, 0.3281, 0.5469, 0.7656]
-        ], dtype=torch.float32)
-        self.register_buffer('lut', lut_data)
-        
-        # Energy metrics tracking
-        self.total_sq_spikes = 0.0
-        self.total_v_spikes = 0.0
-        self.num_elements = 0
-        self.num_samples = 0
-        
-    def load_from_standard_layernorm(self, ln):
-        with torch.no_grad():
-            self.weight.copy_(ln.weight)
-            self.bias.copy_(ln.bias)
-            
-    def evaluate_invsqrt_mantissa_pwl(self, M):
-        mask1 = (M < 1.375)
-        mask2 = (M >= 1.375) & (M < 1.75)
-        mask3 = (M >= 1.75) & (M < 2.125)
-        mask4 = (M >= 2.125) & (M < 2.5)
-        mask5 = (M >= 2.5) & (M < 2.875)
-        mask6 = (M >= 2.875) & (M < 3.25)
-        mask7 = (M >= 3.25) & (M < 3.625)
-        mask8 = (M >= 3.625)
-        
-        w = torch.zeros_like(M)
-        c = torch.zeros_like(M)
-        
-        w = torch.where(mask1, torch.tensor(-0.3925, device=M.device), w)
-        c = torch.where(mask1, torch.tensor(1.3925, device=M.device), c)
-        w = torch.where(mask2, torch.tensor(-0.2584, device=M.device), w)
-        c = torch.where(mask2, torch.tensor(1.2081, device=M.device), c)
-        w = torch.where(mask3, torch.tensor(-0.1864, device=M.device), w)
-        c = torch.where(mask3, torch.tensor(1.0821, device=M.device), c)
-        w = torch.where(mask4, torch.tensor(-0.1427, device=M.device), w)
-        c = torch.where(mask4, torch.tensor(0.9893, device=M.device), c)
-        w = torch.where(mask5, torch.tensor(-0.1139, device=M.device), w)
-        c = torch.where(mask5, torch.tensor(0.9173, device=M.device), c)
-        w = torch.where(mask6, torch.tensor(-0.0936, device=M.device), w)
-        c = torch.where(mask6, torch.tensor(0.8589, device=M.device), c)
-        w = torch.where(mask7, torch.tensor(-0.0787, device=M.device), w)
-        c = torch.where(mask7, torch.tensor(0.8105, device=M.device), c)
-        w = torch.where(mask8, torch.tensor(-0.0672, device=M.device), w)
-        c = torch.where(mask8, torch.tensor(0.7688, device=M.device), c)
-        
-        return w * M + c
-        
-    def forward(self, x):
-        dim = -1
-        n = x.shape[dim]
-        original_shape = x.shape
-        x_flat = x.view(-1, n)
-        
-        # 1. Mean & Centered Diff
-        mu = x_flat.mean(dim=dim, keepdim=True)
-        centered = x_flat - mu
-        
-        # Squaring via Mitchell C-2 approximate multiplication to leverage error cancellation
-        centered_sq = mitchell_c2_multiply(centered, centered, self.lut)
-        sum_sq = centered_sq.sum(dim=dim, keepdim=True)
-        
-        # 2. Inverse Square Root
-        v = sum_sq + n * self.eps
-        M_adj, E_adj = _fp_decompose_even_exp(v)
-        
-        inv_sqrt_M = self.evaluate_invsqrt_mantissa_pwl(M_adj)
-        shift = torch.pow(2.0, -E_adj / 2.0)
-        inv_sqrt = inv_sqrt_M * shift
-        inv_sqrt_var = inv_sqrt * math.sqrt(n)
-        
-        # 3. Mitchell C-2 multiplication
-        out = mitchell_c2_multiply(centered, inv_sqrt_var.expand_as(centered), self.lut)
-        
-        # 4. Energy metrics profiling (1D S-PLA Firing Rates)
-        with torch.no_grad():
-            self.total_sq_spikes += 0
-            _, spikes_v = self.proposed_encoder(v)
-            self.total_v_spikes += spikes_v.abs().float().sum().item()
-            self.num_elements += x_flat.numel()
-            self.num_samples += x_flat.shape[0]
-            
-        out_reshaped = out.view(original_shape)
-        return out_reshaped * self.weight + self.bias
-
-
-class SPLAActivationWrapper(nn.Module):
-    """
-    SPLA Activation Wrapper driven by BFE spikes.
-    """
-    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3):
-        super().__init__()
-        self.spla = SBTSPLAActivation(target_name=target_name, timesteps=timesteps, scale_factor=scale_factor, prefix_k=prefix_k)
-        self.total_spikes = 0.0
-        self.num_elements = 0
-        
-    def forward(self, x):
-        out_step, spikes, _, _ = self.spla(x, return_details=True)
-        
-        with torch.no_grad():
-            self.total_spikes += spikes.abs().float().sum().item()
-            self.num_elements += x.numel()
-            
-        return out_step
+# SPLALayerNorm and SPLAActivationWrapper are now imported from modules.S-PLA
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,7 +257,7 @@ def replace_vit_modules_with_approx(model, ranges, args, device):
             if ln_before is not None:
                 r_before = ranges[f"layer_{i}_ln_before"]
                 scale_before = max(abs(r_before[0]), abs(r_before[1])) * pad
-                mbe_ln_b = SPLALayerNorm(ln_before.normalized_shape[0], timesteps=args.timesteps, s_val=scale_before).to(device)
+                mbe_ln_b = SPLALayerNorm(ln_before.normalized_shape[0], timesteps=args.timesteps, s_val=scale_before, approx_square='mitchell').to(device)
                 mbe_ln_b.load_from_standard_layernorm(ln_before)
                 # Bind back dynamically
                 for attr_name in dir(layer):
@@ -402,7 +271,7 @@ def replace_vit_modules_with_approx(model, ranges, args, device):
             if ln_after is not None:
                 r_after = ranges[f"layer_{i}_ln_after"]
                 scale_after = max(abs(r_after[0]), abs(r_after[1])) * pad
-                mbe_ln_a = SPLALayerNorm(ln_after.normalized_shape[0], timesteps=args.timesteps, s_val=scale_after).to(device)
+                mbe_ln_a = SPLALayerNorm(ln_after.normalized_shape[0], timesteps=args.timesteps, s_val=scale_after, approx_square='mitchell').to(device)
                 mbe_ln_a.load_from_standard_layernorm(ln_after)
                 # Bind back dynamically
                 for attr_name in dir(layer):
@@ -453,7 +322,7 @@ def replace_vit_modules_with_approx(model, ranges, args, device):
     if args.replace_ln and hasattr(vit_model, 'layernorm'):
         r_f = ranges["ln_f"]
         scale_lnf = max(abs(r_f[0]), abs(r_f[1])) * pad
-        mbe_lnf = SPLALayerNorm(vit_model.layernorm.normalized_shape[0], timesteps=args.timesteps, s_val=scale_lnf).to(device)
+        mbe_lnf = SPLALayerNorm(vit_model.layernorm.normalized_shape[0], timesteps=args.timesteps, s_val=scale_lnf, approx_square='mitchell').to(device)
         mbe_lnf.load_from_standard_layernorm(vit_model.layernorm)
         vit_model.layernorm = mbe_lnf
 

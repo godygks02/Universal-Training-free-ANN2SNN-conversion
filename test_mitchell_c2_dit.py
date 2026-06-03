@@ -32,7 +32,7 @@ if current_dir not in sys.path:
 
 # Import modularized components
 try:
-    from modules.IEEE_754_based_Encoding import ExponentGuidedBitSliceEncoder
+    from modules.IEEE_754_based_Encoding import IEEE754_based_encoder
     mitchell_c2_approx = importlib.import_module("modules.mitchell_c-2_approx")
     spla_module = importlib.import_module("modules.S-PLA")
     
@@ -42,66 +42,17 @@ try:
     mitchell_c2_matmul_qk = mitchell_c2_approx.mitchell_c2_matmul_qk
     mitchell_c2_matmul_av = mitchell_c2_approx.mitchell_c2_matmul_av
     SBTSPLAActivation = spla_module.SBTSPLAActivation
+    SPLALayerNorm = spla_module.SPLALayerNorm
+    ProposedSoftmaxSPLA = spla_module.ProposedSoftmaxSPLA
+    SPLAActivationWrapper = spla_module.SPLAActivationWrapper
 except ImportError as e:
     print(f"[Warning] Failed to import modularized SNN library elements: {e}")
     print("Please verify that modules/ directory is present and correct.")
     raise e
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Proposed Exponent-Guided S-PLA Softmax
+# 1. Proposed Exponent-Guided S-PLA Softmax (Imported from modules.S-PLA)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class ProposedSoftmaxSPLA(nn.Module):
-    def __init__(self, timesteps=16, s_val=8.0):
-        super().__init__()
-        self.timesteps = timesteps
-        self.s_val = s_val
-        self.encoder = ExponentGuidedBitSliceEncoder(timesteps=timesteps, s=math.ceil(math.log2(s_val)))
-        self.total_spikes = 0.0
-        self.num_elements = 0
-
-    def evaluate_exp_frac_pwl(self, f):
-        mask = (f < 0.5)
-        w = torch.where(mask, torch.tensor(0.828427, device=f.device), torch.tensor(1.171573, device=f.device))
-        c = torch.where(mask, torch.tensor(1.000000, device=f.device), torch.tensor(0.828427, device=f.device))
-        return w * f + c
-
-    def evaluate_recip_mantissa_pwl(self, M):
-        mask = (M < 1.5)
-        w = torch.where(mask, torch.tensor(-0.666667, device=M.device), torch.tensor(-0.333333, device=M.device))
-        c = torch.where(mask, torch.tensor(1.666667, device=M.device), torch.tensor(1.166667, device=M.device))
-        return w * M + c
-
-    def forward(self, x, dim=-1):
-        x_max = x.max(dim=dim, keepdim=True).values
-        x_stable = x - x_max
-        y = x_stable * math.log2(math.e)
-        E = torch.floor(y)
-        frac = y - E
-        
-        y_frac = self.evaluate_exp_frac_pwl(frac)
-        exp_x = y_frac * torch.pow(2.0, E)
-        
-        sum_exp = exp_x.sum(dim=dim, keepdim=True)
-        E_raw = torch.floor(torch.log2(sum_exp.clamp(min=1e-30)))
-        M = sum_exp / torch.pow(2.0, E_raw)
-        
-        y_mantissa_recip = self.evaluate_recip_mantissa_pwl(M)
-        recip_sum = y_mantissa_recip * torch.pow(2.0, -E_raw)
-        
-        recip_broadcast = recip_sum.expand_as(exp_x)
-        
-        _, spikes_exp = self.encoder(exp_x)
-        _, spikes_recip = self.encoder(recip_broadcast)
-        
-        with torch.no_grad():
-            self.total_spikes += spikes_exp.abs().float().sum().item() + spikes_recip.abs().float().sum().item()
-            self.num_elements += exp_x.numel() + recip_broadcast.numel()
-            
-        out = exp_x * recip_broadcast
-        out_sum = out.sum(dim=dim, keepdim=True).clamp(min=1e-8)
-        out = out / out_sum
-        return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Spiking Attention Processor (Mitchell C-2 & Proposed Softmax S-PLA)
@@ -203,135 +154,8 @@ class MitchellC2DiTAttnProcessor(nn.Module):
         return hidden_states
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. High-Fidelity S-PLA LayerNorm and GELU Activations
+# 3. High-Fidelity S-PLA LayerNorm and GELU Activations (Imported from modules.S-PLA)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _fp_decompose_even_exp(v: torch.Tensor):
-    v_safe = v.abs().clamp(min=1e-38)
-    E_raw  = torch.floor(torch.log2(v_safe))
-    M_raw  = v_safe / torch.pow(2.0, E_raw)
-    is_odd = (E_raw % 2).abs() > 0.5
-    E_adj  = torch.where(is_odd, E_raw - 1, E_raw)
-    M_adj  = torch.where(is_odd, M_raw * 2.0, M_raw)
-    return M_adj, E_adj
-
-class SPLALayerNorm(nn.Module):
-    def __init__(self, normalized_shape, eps=1e-5, s_val=3.0, timesteps=16):
-        super().__init__()
-        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else normalized_shape
-        self.eps = eps
-        self.s_val = s_val
-        self.timesteps = timesteps
-        
-        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
-        
-        self.proposed_encoder = ExponentGuidedBitSliceEncoder(timesteps=timesteps, s=math.ceil(math.log2(s_val)))
-        
-        lut_data = torch.tensor([
-            [0.0156, 0.0469, 0.0781, 0.1094],
-            [0.0469, 0.1406, 0.2344, 0.3281],
-            [0.0781, 0.2344, 0.3906, 0.5469],
-            [0.1094, 0.3281, 0.5469, 0.7656]
-        ], dtype=torch.float32)
-        self.register_buffer('lut', lut_data)
-        
-        self.total_sq_spikes = 0.0
-        self.total_v_spikes = 0.0
-        self.num_elements = 0
-        self.num_samples = 0
-        
-    def load_from_standard_layernorm(self, ln):
-        with torch.no_grad():
-            if hasattr(ln, 'weight') and ln.weight is not None:
-                self.weight.copy_(ln.weight)
-            if hasattr(ln, 'bias') and ln.bias is not None:
-                self.bias.copy_(ln.bias)
-            
-    def evaluate_invsqrt_mantissa_pwl(self, M):
-        mask1 = (M < 1.375)
-        mask2 = (M >= 1.375) & (M < 1.75)
-        mask3 = (M >= 1.75) & (M < 2.125)
-        mask4 = (M >= 2.125) & (M < 2.5)
-        mask5 = (M >= 2.5) & (M < 2.875)
-        mask6 = (M >= 2.875) & (M < 3.25)
-        mask7 = (M >= 3.25) & (M < 3.625)
-        mask8 = (M >= 3.625)
-        
-        w = torch.zeros_like(M)
-        c = torch.zeros_like(M)
-        
-        w = torch.where(mask1, torch.tensor(-0.3925, device=M.device), w)
-        c = torch.where(mask1, torch.tensor(1.3925, device=M.device), c)
-        w = torch.where(mask2, torch.tensor(-0.2584, device=M.device), w)
-        c = torch.where(mask2, torch.tensor(1.2081, device=M.device), c)
-        w = torch.where(mask3, torch.tensor(-0.1864, device=M.device), w)
-        c = torch.where(mask3, torch.tensor(1.0821, device=M.device), c)
-        w = torch.where(mask4, torch.tensor(-0.1427, device=M.device), w)
-        c = torch.where(mask4, torch.tensor(0.9893, device=M.device), c)
-        w = torch.where(mask5, torch.tensor(-0.1139, device=M.device), w)
-        c = torch.where(mask5, torch.tensor(0.9173, device=M.device), c)
-        w = torch.where(mask6, torch.tensor(-0.0936, device=M.device), w)
-        c = torch.where(mask6, torch.tensor(0.8589, device=M.device), c)
-        w = torch.where(mask7, torch.tensor(-0.0787, device=M.device), w)
-        c = torch.where(mask7, torch.tensor(0.8105, device=M.device), c)
-        w = torch.where(mask8, torch.tensor(-0.0672, device=M.device), w)
-        c = torch.where(mask8, torch.tensor(0.7688, device=M.device), c)
-        
-        return w * M + c
-        
-    def forward(self, x):
-        dim = -1
-        n = x.shape[dim]
-        original_shape = x.shape
-        x_flat = x.reshape(-1, n)
-        
-        # 1. Mean & Centered Diff
-        mu = x_flat.mean(dim=dim, keepdim=True)
-        centered = x_flat - mu
-        
-        # Squaring via Mitchell C-2 approximate multiplication
-        centered_sq = mitchell_c2_multiply(centered, centered, self.lut)
-        sum_sq = centered_sq.sum(dim=dim, keepdim=True)
-        
-        # 2. Inverse Square Root
-        v = sum_sq + n * self.eps
-        M_adj, E_adj = _fp_decompose_even_exp(v)
-        
-        inv_sqrt_M = self.evaluate_invsqrt_mantissa_pwl(M_adj)
-        shift = torch.pow(2.0, -E_adj / 2.0)
-        inv_sqrt = inv_sqrt_M * shift
-        inv_sqrt_var = inv_sqrt * math.sqrt(n)
-        
-        # 3. Mitchell C-2 multiplication
-        out = mitchell_c2_multiply(centered, inv_sqrt_var.expand_as(centered), self.lut)
-        
-        # 4. Energy metrics profiling
-        with torch.no_grad():
-            self.total_sq_spikes += 0
-            _, spikes_v = self.proposed_encoder(v)
-            self.total_v_spikes += spikes_v.abs().float().sum().item()
-            self.num_elements += x_flat.numel()
-            self.num_samples += x_flat.shape[0]
-            
-        out_reshaped = out.reshape(original_shape)
-        return out_reshaped * self.weight + self.bias
-
-class SPLAActivationWrapper(nn.Module):
-    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3):
-        super().__init__()
-        self.spla = SBTSPLAActivation(target_name=target_name, timesteps=timesteps, scale_factor=scale_factor, prefix_k=prefix_k)
-        self.total_spikes = 0.0
-        self.num_elements = 0
-        
-    def forward(self, x):
-        out_step, spikes, _, _ = self.spla(x, return_details=True)
-        
-        with torch.no_grad():
-            self.total_spikes += spikes.abs().float().sum().item()
-            self.num_elements += x.numel()
-            
-        return out_step
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Calibration & Module Replacement logic
@@ -416,7 +240,7 @@ def convert_dit_to_snn(model, ranges, args, device):
                 else:
                     scale_val = 3.0 # fallback
                     
-                snn_ln = SPLALayerNorm(child_module.normalized_shape[0], timesteps=timesteps, s_val=scale_val).to(device)
+                snn_ln = SPLALayerNorm(child_module.normalized_shape[0], timesteps=timesteps, s_val=scale_val, approx_square='mitchell').to(device)
                 snn_ln.load_from_standard_layernorm(child_module)
                 setattr(parent_module, child_name, snn_ln)
                 

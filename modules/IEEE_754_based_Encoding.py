@@ -9,7 +9,7 @@ using hardware-wired bitwise shift and mask operations.
 import torch
 import torch.nn as nn
 
-class ExponentGuidedBitSliceEncoder(nn.Module):
+class IEEE754_based_encoder(nn.Module):
     """
     IEEE 754 Exponent-Guided Bit-Slice Spiking Encoder.
     
@@ -64,7 +64,6 @@ class ExponentGuidedBitSliceEncoder(nn.Module):
         
         # Slice mantissa bits in parallel
         mantissa_bit = (M.unsqueeze(0) >> safe_shift) & 1
-        mantissa_bit = torch.where(valid_mask, mantissa_bit, torch.zeros_like(implicit_bit if 'implicit_bit' in locals() else mantissa_bit)) # Safe fallback
         mantissa_bit = torch.where(valid_mask, mantissa_bit, torch.zeros_like(mantissa_bit))
         
         # Implicit leading bit (occurs exactly when the exponent matches the target power: e == s - t)
@@ -91,3 +90,6 @@ class ExponentGuidedBitSliceEncoder(nn.Module):
         # Apply sign control: ADD if S == 0, SUBTRACT if S == 1
         sign_factor = torch.where(S == 0, torch.ones_like(unsigned_sum), -torch.ones_like(unsigned_sum))
         return unsigned_sum * sign_factor
+
+# Alias for backward compatibility
+ExponentGuidedBitSliceEncoder = IEEE754_based_encoder
