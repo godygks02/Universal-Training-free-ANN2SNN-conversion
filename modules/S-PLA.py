@@ -101,7 +101,7 @@ class SBTSNeuron(nn.Module):
 # ---------------------------------------------------------------------------
 # Offline Segment Calibration
 # ---------------------------------------------------------------------------
-def calibrate_pla_segments(target_func, scale_factor, timesteps, prefix_k, num_grid_points=100000, device='cpu'):
+def calibrate_pla_segments(target_func, scale_factor, timesteps, prefix_k, min_e_routing=-5, num_grid_points=100000, device='cpu'):
     """
     Offline calibration of PLA segments based on IEEE 754 prefix routing.
     """
@@ -111,13 +111,20 @@ def calibrate_pla_segments(target_func, scale_factor, timesteps, prefix_k, num_g
     x_grid_torch = torch.from_numpy(x_grid).float().to(device).unsqueeze(1)
     
     with torch.no_grad():
-        S, spikes = encoder(x_grid_torch)
+        S, spikes, e = encoder(x_grid_torch)
         
     d_prefix = encoder.d[:prefix_k].view(prefix_k, 1, 1)
     spikes_prefix = spikes[:prefix_k]
-    unsigned_sum = torch.sum(spikes_prefix * d_prefix, dim=0)
-    sign_factor = torch.where(S == 0, torch.ones_like(unsigned_sum), -torch.ones_like(unsigned_sum))
-    x_rec_prefix = unsigned_sum * sign_factor
+    M_rec_prefix = torch.sum(spikes_prefix * d_prefix, dim=0)
+    
+    # Exponent Clamping for prefix routing to prevent segment explosion / OOM
+    e_prefix = torch.clamp(e, min=min_e_routing)
+    scale_factor_e = torch.pow(2.0, e_prefix.float())
+    sign_factor = torch.where(S == 0, torch.ones_like(M_rec_prefix), -torch.ones_like(M_rec_prefix))
+    
+    x_rec_prefix = M_rec_prefix * scale_factor_e * sign_factor
+    # Route all values below min_e_routing to the same central segment (0.0)
+    x_rec_prefix = torch.where(e >= min_e_routing, x_rec_prefix, torch.zeros_like(x_rec_prefix))
     
     x_rec_prefix_np = x_rec_prefix[:, 0].cpu().numpy()
     x_rec_prefix_rounded = np.round(x_rec_prefix_np, decimals=8)
@@ -152,18 +159,19 @@ def calibrate_pla_segments(target_func, scale_factor, timesteps, prefix_k, num_g
 # ---------------------------------------------------------------------------
 # Core Spike-Driven PLA Activation Module
 # ---------------------------------------------------------------------------
-class SBTSPLAActivation(nn.Module):
+class IEEE754_based_SPLA(nn.Module):
     """
     Piecewise Linear Approximation (PLA) using IEEE 754 spike-based prefix routing.
     f(x) ≈ a_i * x + b_i
     Where segment index 'i' is determined solely by the first K spikes of IEEE 754 encoding.
     """
-    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3, num_grid_points=100000):
+    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3, min_e_routing=-5, num_grid_points=100000):
         super().__init__()
         self.target_name = target_name.lower()
         self.timesteps = timesteps
         self.scale_factor = scale_factor
         self.prefix_k = prefix_k
+        self.min_e_routing = min_e_routing
         
         targets = {
             'sigmoid': lambda x: 1.0 / (1.0 + np.exp(-x)),
@@ -178,7 +186,7 @@ class SBTSPLAActivation(nn.Module):
         self.encoder = IEEE754_based_encoder(timesteps=timesteps, s=0)
         
         unique_vals, slopes, intercepts, boundaries = calibrate_pla_segments(
-            self.target_func, scale_factor, timesteps, prefix_k, num_grid_points
+            self.target_func, scale_factor, timesteps, prefix_k, min_e_routing, num_grid_points
         )
         
         self.register_buffer('unique_vals', torch.tensor(unique_vals, dtype=torch.float32))
@@ -188,20 +196,29 @@ class SBTSPLAActivation(nn.Module):
         
     def forward(self, x, return_details=False):
         x_norm = (x / self.scale_factor).clamp(-1.0, 1.0)
-        S, spikes = self.encoder(x_norm)
+        S, spikes, e = self.encoder(x_norm)
         
         d_prefix = self.encoder.d[:self.prefix_k].view(self.prefix_k, *([1] * x.dim()))
         spikes_prefix = spikes[:self.prefix_k]
-        unsigned_sum = torch.sum(spikes_prefix * d_prefix, dim=0)
-        sign_factor = torch.where(S == 0, torch.ones_like(unsigned_sum), -torch.ones_like(unsigned_sum))
-        x_rec_prefix = unsigned_sum * sign_factor
+        M_rec_prefix = torch.sum(spikes_prefix * d_prefix, dim=0)
+        
+        # Exponent Clamping for prefix routing to prevent segment explosion / OOM
+        e_prefix = torch.clamp(e, min=self.min_e_routing)
+        scale_factor_e = torch.pow(2.0, e_prefix.float())
+        sign_factor = torch.where(S == 0, torch.ones_like(M_rec_prefix), -torch.ones_like(M_rec_prefix))
+        
+        x_rec_prefix = M_rec_prefix * scale_factor_e * sign_factor
+        # Route all values below min_e_routing to the same central segment (0.0)
+        x_rec_prefix = torch.where(e >= self.min_e_routing, x_rec_prefix, torch.zeros_like(x_rec_prefix))
         
         seg_idx = torch.bucketize(x_rec_prefix, self.boundaries)
         
         a_i = self.slopes[seg_idx]
         b_i = self.intercepts[seg_idx]
         
-        A_i = a_i * self.scale_factor
+        # Apply Exponent Wired-Alignment: scale slope by 2^e (actual un-clamped exponent)
+        scale_factor_actual_e = torch.pow(2.0, e.float())
+        A_i = a_i * self.scale_factor * scale_factor_actual_e
         d_broadcast = self.encoder.d.view(-1, *([1] * x.dim()))
         
         sign_broadcast = sign_factor.unsqueeze(0)
@@ -370,12 +387,12 @@ class SPLALayerNorm(nn.Module):
         # 4. Track Firing Rates for Energy Metrics (1D S-PLA)
         with torch.no_grad():
             if self.approx_square == 'pwl':
-                _, spikes_sq = self.proposed_encoder(a)
+                _, spikes_sq, _ = self.proposed_encoder(a)
                 self.total_sq_spikes += spikes_sq.abs().float().sum().item()
             else:
                 self.total_sq_spikes += 0.0
                 
-            _, spikes_v = self.proposed_encoder(v)
+            _, spikes_v, _ = self.proposed_encoder(v)
             self.total_v_spikes += spikes_v.abs().float().sum().item()
             self.num_elements += x_flat.numel()
             self.num_samples += x_flat.shape[0]
@@ -440,8 +457,8 @@ class ProposedSoftmaxSPLA(nn.Module):
         recip_broadcast = recip_sum.expand_as(exp_x)
         
         # Encode to capture spike statistics
-        _, spikes_exp = self.encoder(exp_x)
-        _, spikes_recip = self.encoder(recip_broadcast)
+        _, spikes_exp, _ = self.encoder(exp_x)
+        _, spikes_recip, _ = self.encoder(recip_broadcast)
         
         with torch.no_grad():
             self.total_spikes += spikes_exp.abs().float().sum().item() + spikes_recip.abs().float().sum().item()
@@ -462,9 +479,9 @@ class SPLAActivationWrapper(nn.Module):
     SPLA Activation Wrapper driven by IEEE 754 encoder spikes.
     Tracks firing rate and spike totals to compute exact INT dynamic additions.
     """
-    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3):
+    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3, min_e_routing=-5):
         super().__init__()
-        self.spla = SBTSPLAActivation(target_name=target_name, timesteps=timesteps, scale_factor=scale_factor, prefix_k=prefix_k)
+        self.spla = IEEE754_based_SPLA(target_name=target_name, timesteps=timesteps, scale_factor=scale_factor, prefix_k=prefix_k, min_e_routing=min_e_routing)
         self.total_spikes = 0.0
         self.num_elements = 0
         
@@ -477,3 +494,7 @@ class SPLAActivationWrapper(nn.Module):
             self.num_elements += x.numel()
             
         return out_step
+
+
+# Legacy alias for backward compatibility
+SBTSPLAActivation = IEEE754_based_SPLA

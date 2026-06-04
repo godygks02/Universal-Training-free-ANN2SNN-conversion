@@ -55,11 +55,15 @@ graph TD
     F --> G[Near-Lossless Spiking Inference & Massive Energy Reduction]
 ```
 
-### 1. IEEE 754 Exponent-Guided Spiking Encoding
-Rather than using stochastic rate coding (which demands thousands of timesteps to represent float precisions), we utilize an **IEEE 754-based Spiking Encoder** (`IEEE754_based_encoder`). This encoder extracts binary spike trains ($s_t \in \{0, 1\}$) directly from FP32 tensors, emulating a zero-cost hardware-wired shift bus, paired with a separate sign bit $S \in \{0, 1\}$ to steer sign-controlled synaptic accumulation:
-- **Sign-Controlled Binary Spike Encoding**:
-  $$v \approx (-1)^S \sum_{t=1}^{T} s_t \cdot 2^{-t} \cdot 2^{E_{\text{scale}}}$$
-  where $s_t \in \{0, 1\}$ represents the binary spike train and $S \in \{0, 1\}$ controls the synaptic sign (ADD if $S=0$, SUBTRACT if $S=1$). This enables high-precision representations inside a minimal number of timesteps ($T = 16$).
+### 1. IEEE 754 Pure Mantissa Spiking Encoding
+Rather than using stochastic rate coding (which demands thousands of timesteps to represent float precisions), we utilize a hardware-friendly **IEEE 754-based Spiking Encoder** (`IEEE754_based_encoder`). To prevent truncation errors at small values and boundary wrap-around, the encoder streams the **pure mantissa** $M_{\text{rec}} \in [1.0, 2.0)$ as a binary spike train $s_t \in \{0, 1\}$, and returns the exponent $e = E - 127$ as a separate variable:
+- **Mantissa-Space Spiking & Exponent Alignment**:
+  $$v \approx (-1)^S \cdot M_{\text{rec}} \cdot 2^e$$
+  where the reconstructed mantissa is:
+  $$M_{\text{rec}} = \sum_{t=1}^{T} s_t \cdot 2^{-t+1}$$
+  - $s_1 \in \{0, 1\}$ represents the implicit leading bit (1 for normal floats, 0 for zero/subnormal).
+  - $s_{2..T} \in \{0, 1\}$ represent the extracted mantissa bits from MSB to LSB.
+  This preserves the full $T$-bit resolution of the mantissa even for extremely small values, completely eliminating underflow truncation and overflow wrap-around errors.
 
 ### 2. Mitchell C-2 Logarithmic Multiplication
 Multiplications inside linear projection and attention matrix multiplication layers dominate neural network energy profiles ($4.6\text{ pJ}$ per standard FP32 MAC). We substitute standard multipliers with the **Mitchell C-2 Logarithmic Multiplier** (`MitchellC2Linear`, `mitchell_c2_matmul_qk`, `mitchell_c2_matmul_av`):
@@ -75,9 +79,10 @@ Activations (GELU, Softmax) and normalization blocks (LayerNorm) present extreme
 - **LayerNorm Approximation**: CENTERING, SQUARING, and INVERSE SQUARE ROOT are fully mapped to PWL segments:
   $$\text{Var}(x) = \frac{1}{n} \sum (x - \mu)^2_{\text{Mitchell-C2}}$$
   $$\text{InvSqrt}(Var(x)) = \text{PWL}_{\text{InvSqrt}}(M_{\text{Var}}) \cdot 2^{-\frac{E_{\text{Var}}}{2}}$$
-- **GELU Approximation**:
-  $$\text{GELU}(x) \approx \text{PWL}_{\text{GELU}}(x)$$
-  Replacing standard GELU ($65.4\text{ pJ}$) with S-PLA Pure Shift-and-Add operations costing only **$0.1\text{ pJ}$** per active spike!
+- **GELU Exponent-Wired Alignment**:
+  S-PLA performs piecewise linear approximation $f(x) \approx a_i \cdot x + b_i$. Under the pure mantissa streaming design, S-PLA aligns the slope $a_i$ with the exponent $e$ via a single wired-shift $\tilde{a}_i = a_i \cdot \text{scale\_factor} \cdot 2^e$, and then computes:
+  $$\text{GELU}(x) \approx b_i + \sum_{t=1}^T s_t \cdot 2^{-t+1} \cdot \tilde{a}_i \cdot (-1)^S$$
+  This replaces the heavy standard GELU ($65.4\text{ pJ}$) with local S-PLA Pure Shift-and-Add operations costing only **$0.1\text{ pJ}$** per active spike, while reducing the number of variable shifters in hardware from $T$ to 1.
 - **Softmax S-PLA**: Calculates approximate $e^x$ and reciprocals using Exponent-Guided Bit-Slice spiking to maintain high-fidelity attention routing.
 
 ---
