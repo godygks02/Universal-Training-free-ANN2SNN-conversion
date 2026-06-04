@@ -45,6 +45,21 @@ SPLALayerNorm = spla_module.SPLALayerNorm
 SPLAActivationWrapper = spla_module.SPLAActivationWrapper
 
 
+# Map Imagenette label indices to ImageNet-1k class indices
+IMAGENETTE_TO_IMAGENET = {
+    0: 0,    # tench
+    1: 217,  # English springer
+    2: 482,  # cassette player
+    3: 491,  # chain saw
+    4: 497,  # church
+    5: 566,  # French horn
+    6: 569,  # garbage truck
+    7: 571,  # gas pump
+    8: 574,  # golf ball
+    9: 701   # parachute
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Mitchell C-2 & S-PLA ViTSelfAttention Replacement
 # ─────────────────────────────────────────────────────────────────────────────

@@ -283,8 +283,14 @@ class SPLALayerNorm(nn.Module):
         
     def load_from_standard_layernorm(self, ln):
         with torch.no_grad():
-            self.weight.copy_(ln.weight)
-            self.bias.copy_(ln.bias)
+            if ln.weight is not None:
+                self.weight.copy_(ln.weight)
+            else:
+                self.weight = None
+            if ln.bias is not None:
+                self.bias.copy_(ln.bias)
+            else:
+                self.bias = None
             
     def evaluate_square_pwl(self, a):
         # 8-segment PWL Square Approximation
@@ -356,7 +362,7 @@ class SPLALayerNorm(nn.Module):
         dim = -1
         n = x.shape[dim]
         original_shape = x.shape
-        x_flat = x.view(-1, n)
+        x_flat = x.reshape(-1, n)
         
         # 1. Mean & Centered Diff
         mu = x_flat.mean(dim=dim, keepdim=True)
@@ -397,8 +403,12 @@ class SPLALayerNorm(nn.Module):
             self.num_elements += x_flat.numel()
             self.num_samples += x_flat.shape[0]
             
-        out_reshaped = out.view(original_shape)
-        return out_reshaped * self.weight + self.bias
+        out_reshaped = out.reshape(original_shape)
+        if self.weight is not None:
+            out_reshaped = out_reshaped * self.weight
+        if self.bias is not None:
+            out_reshaped = out_reshaped + self.bias
+        return out_reshaped
 
 
 # ---------------------------------------------------------------------------

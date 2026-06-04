@@ -149,7 +149,7 @@ class MitchellC2DiTAttnProcessor(nn.Module):
             hidden_states = attn.to_out(hidden_states)
             
         if input_ndim == 4:
-            hidden_states = hidden_states.transpose(1, 2).view(batch_size, channel, height, width)
+            hidden_states = hidden_states.transpose(1, 2).contiguous().view(batch_size, channel, height, width)
             
         return hidden_states
 
