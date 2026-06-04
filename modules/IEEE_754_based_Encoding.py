@@ -80,8 +80,8 @@ class IEEE754_based_encoder(nn.Module):
         d_broadcast = self.d.view(-1, *([1] * S.dim()))
         M_rec = torch.sum(spikes * d_broadcast, dim=0)
         
-        # Apply exponent: scale by 2^e
-        scale_factor = torch.pow(2.0, e.float())
+        # Apply exponent: scale by 2^e using safe bitwise float view hack (zero latency on GPU/CPU)
+        scale_factor = ((e + 127).to(torch.int32) << 23).view(torch.float32)
         
         # Apply sign control: ADD if S == 0, SUBTRACT if S == 1
         sign_factor = torch.where(S == 0, torch.ones_like(M_rec), -torch.ones_like(M_rec))

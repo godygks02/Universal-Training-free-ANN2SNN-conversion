@@ -119,7 +119,7 @@ def calibrate_pla_segments(target_func, scale_factor, timesteps, prefix_k, min_e
     
     # Exponent Clamping for prefix routing to prevent segment explosion / OOM
     e_prefix = torch.clamp(e, min=min_e_routing)
-    scale_factor_e = torch.pow(2.0, e_prefix.float())
+    scale_factor_e = ((e_prefix + 127).to(torch.int32) << 23).view(torch.float32)
     sign_factor = torch.where(S == 0, torch.ones_like(M_rec_prefix), -torch.ones_like(M_rec_prefix))
     
     x_rec_prefix = M_rec_prefix * scale_factor_e * sign_factor
@@ -204,7 +204,7 @@ class IEEE754_based_SPLA(nn.Module):
         
         # Exponent Clamping for prefix routing to prevent segment explosion / OOM
         e_prefix = torch.clamp(e, min=self.min_e_routing)
-        scale_factor_e = torch.pow(2.0, e_prefix.float())
+        scale_factor_e = ((e_prefix + 127).to(torch.int32) << 23).view(torch.float32)
         sign_factor = torch.where(S == 0, torch.ones_like(M_rec_prefix), -torch.ones_like(M_rec_prefix))
         
         x_rec_prefix = M_rec_prefix * scale_factor_e * sign_factor
@@ -217,7 +217,7 @@ class IEEE754_based_SPLA(nn.Module):
         b_i = self.intercepts[seg_idx]
         
         # Apply Exponent Wired-Alignment: scale slope by 2^e (actual un-clamped exponent)
-        scale_factor_actual_e = torch.pow(2.0, e.float())
+        scale_factor_actual_e = ((e + 127).to(torch.int32) << 23).view(torch.float32)
         A_i = a_i * self.scale_factor * scale_factor_actual_e
         d_broadcast = self.encoder.d.view(-1, *([1] * x.dim()))
         

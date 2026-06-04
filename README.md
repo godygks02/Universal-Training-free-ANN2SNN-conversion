@@ -83,6 +83,11 @@ Activations (GELU, Softmax) and normalization blocks (LayerNorm) present extreme
   S-PLA performs piecewise linear approximation $f(x) \approx a_i \cdot x + b_i$. Under the pure mantissa streaming design, S-PLA aligns the slope $a_i$ with the exponent $e$ via a single wired-shift $\tilde{a}_i = a_i \cdot \text{scale\_factor} \cdot 2^e$, and then computes:
   $$\text{GELU}(x) \approx b_i + \sum_{t=1}^T s_t \cdot 2^{-t+1} \cdot \tilde{a}_i \cdot (-1)^S$$
   This replaces the heavy standard GELU ($65.4\text{ pJ}$) with local S-PLA Pure Shift-and-Add operations costing only **$0.1\text{ pJ}$** per active spike, while reducing the number of variable shifters in hardware from $T$ to 1.
+- **Prefix Exponent Clamping & OOM Prevention**:
+  To prevent segment explosion and Out-of-Memory (OOM) issues when scaling the prefix routing bits $K$ (e.g. $K=5$ or $K=6$), S-PLA clamps the prefix routing exponent to $\text{min\_e\_routing} = -5$ by default. Any inputs with $e < -5$ (where the smooth functions are highly linear) are routed to a single central segment ($0.0$). This reduces the segment count from $17 \times 2^K$ (unclamped) to only $2 \times 6 \times 2^{K-1} + 1$ (e.g. **163 segments** for $K=5$), ensuring lightweight calibration and execution. The resulting approximation accuracy is extremely high:
+  * **GELU**: MSE: $3.910 \times 10^{-8}$ \| MaxAE: $2.286 \times 10^{-3}$ (163 segments, $K=5$)
+  * **Tanh**: MSE: $1.710 \times 10^{-9}$ \| MaxAE: $1.795 \times 10^{-4}$ (163 segments, $K=5$)
+  * **Sigmoid**: MSE: $2.888 \times 10^{-10}$ \| MaxAE: $6.101 \times 10^{-5}$ (163 segments, $K=5$)
 - **Softmax S-PLA**: Calculates approximate $e^x$ and reciprocals using Exponent-Guided Bit-Slice spiking to maintain high-fidelity attention routing.
 
 ---
