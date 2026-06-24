@@ -22,3 +22,6 @@ plots/mitchell_c2_snn/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# exe test files
+*.exe
