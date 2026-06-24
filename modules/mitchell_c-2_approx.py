@@ -7,6 +7,7 @@ Bypasses standard FP32 multipliers for Linear layers, Conv1D, and Attention MatM
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 def decompose_float32(x):
@@ -216,3 +217,106 @@ def mitchell_c2_matmul_av(attn_weights, v, lut):
         prod = mitchell_c2_multiply(w_chunk, v_exp, lut) # [B, H, chunk_size, key_len, D]
         out[:, :, i:i_end, :] = prod.sum(dim=3)
     return out
+
+
+class MitchellC2Conv2d(nn.Module):
+    """
+    Mitchell C-2 Logarithmic replacement for PyTorch nn.Conv2d.
+    Supports standard 2D convolutions and Depthwise Separable Convolutions.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+        self.groups = groups
+        
+        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels // groups, *self.kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        lut_data = torch.tensor([
+            [0.0156, 0.0469, 0.0781, 0.1094],
+            [0.0469, 0.1406, 0.2344, 0.3281],
+            [0.0781, 0.2344, 0.3906, 0.5469],
+            [0.1094, 0.3281, 0.5469, 0.7656]
+        ], dtype=torch.float32)
+        self.register_buffer('lut', lut_data)
+        
+    def load_from_standard_conv2d(self, conv2d):
+        with torch.no_grad():
+            self.weight.copy_(conv2d.weight)
+            if self.bias is not None:
+                self.bias.copy_(conv2d.bias)
+                
+    def forward(self, x):
+        B, C, H, W = x.shape
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        dh, dw = self.dilation
+        
+        # Compute output spatial dimensions
+        h_out = (H + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+        w_out = (W + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+        
+        if self.groups == 1:
+            # im2col approach for standard Conv2d
+            x_unfold = F.unfold(x, self.kernel_size, self.dilation, self.padding, self.stride)
+            N_cols = B * h_out * w_out
+            x_flat = x_unfold.permute(0, 2, 1).reshape(N_cols, C * kh * kw)
+            
+            w_flat = self.weight.view(self.out_channels, -1)
+            
+            chunk_size_n = 64
+            chunk_size_f = 64
+            out_flat = torch.empty(N_cols, self.out_channels, device=x.device, dtype=x.dtype)
+            
+            for n_start in range(0, N_cols, chunk_size_n):
+                n_end = min(n_start + chunk_size_n, N_cols)
+                x_chunk = x_flat[n_start:n_end]
+                n_chunk = n_end - n_start
+                
+                for f_start in range(0, self.out_channels, chunk_size_f):
+                    f_end = min(f_start + chunk_size_f, self.out_channels)
+                    f_chunk = f_end - f_start
+                    
+                    x_expanded = x_chunk.unsqueeze(1) # [n_chunk, 1, C * kh * kw]
+                    w_expanded = w_flat[f_start:f_end, :].unsqueeze(0) # [1, f_chunk, C * kh * kw]
+                    
+                    x_broadcast = x_expanded.expand(-1, f_chunk, -1)
+                    w_broadcast = w_expanded.expand(n_chunk, -1, -1)
+                    
+                    prod = mitchell_c2_multiply(x_broadcast, w_broadcast, self.lut)
+                    
+                    if self.bias is not None:
+                        out_flat[n_start:n_end, f_start:f_end] = prod.sum(dim=2) + self.bias[f_start:f_end]
+                    else:
+                        out_flat[n_start:n_end, f_start:f_end] = prod.sum(dim=2)
+                        
+            out = out_flat.view(B, h_out * w_out, self.out_channels).permute(0, 2, 1).view(B, self.out_channels, h_out, w_out)
+            return out
+        else:
+            # Depthwise convolution: groups == in_channels == out_channels
+            if self.groups == C and self.out_channels == C:
+                x_unfold = F.unfold(x, self.kernel_size, self.dilation, self.padding, self.stride)
+                x_unfold = x_unfold.view(B, C, kh * kw, h_out * w_out)
+                
+                w_flat = self.weight.view(C, kh * kw)
+                w_exp = w_flat.unsqueeze(0).unsqueeze(-1) # [1, C, kh * kw, 1]
+                
+                prod = mitchell_c2_multiply(x_unfold, w_exp.expand_as(x_unfold), self.lut)
+                out_sum = prod.sum(dim=2) # [B, C, h_out * w_out]
+                
+                if self.bias is not None:
+                    out_sum = out_sum + self.bias.unsqueeze(0).unsqueeze(-1)
+                    
+                return out_sum.view(B, C, h_out, w_out)
+            else:
+                # Fallback to standard PyTorch Conv2d for general grouped convs to ensure safety
+                return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)

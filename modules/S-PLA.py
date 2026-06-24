@@ -176,7 +176,10 @@ class IEEE754_based_SPLA(nn.Module):
         targets = {
             'sigmoid': lambda x: 1.0 / (1.0 + np.exp(-x)),
             'tanh': np.tanh,
-            'gelu': lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+            'gelu': lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3))),
+            'quick_gelu': lambda x: x / (1.0 + np.exp(-1.702 * x)),
+            'hard_sigmoid': lambda x: np.clip((x + 3.0) / 6.0, 0.0, 1.0),
+            'hard_swish': lambda x: x * np.clip((x + 3.0) / 6.0, 0.0, 1.0)
         }
         if self.target_name not in targets:
             raise ValueError(f"Unknown target function: {target_name}")
@@ -252,13 +255,14 @@ class SPLALayerNorm(nn.Module):
     LayerNorm approximating centering, squaring, and inv_sqrt using S-PLA segments,
     and final scaling utilizing IEEE 754 Exponent-Guided Bit-Slice spiking interaction.
     """
-    def __init__(self, normalized_shape, eps=1e-5, s_val=3.0, timesteps=16, approx_square='pwl'):
+    def __init__(self, normalized_shape, eps=1e-5, s_val=3.0, timesteps=16, approx_square='pwl', track_spikes=False):
         super().__init__()
         self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else normalized_shape
         self.eps = eps
         self.s_val = s_val
         self.timesteps = timesteps
         self.approx_square = approx_square
+        self.track_spikes = track_spikes
         
         self.weight = nn.Parameter(torch.ones(self.normalized_shape))
         self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
@@ -392,14 +396,18 @@ class SPLALayerNorm(nn.Module):
         
         # 4. Track Firing Rates for Energy Metrics (1D S-PLA)
         with torch.no_grad():
-            if self.approx_square == 'pwl':
-                _, spikes_sq, _ = self.proposed_encoder(a)
-                self.total_sq_spikes += spikes_sq.abs().float().sum().item()
+            if self.track_spikes:
+                if self.approx_square == 'pwl':
+                    _, spikes_sq, _ = self.proposed_encoder(a)
+                    self.total_sq_spikes += spikes_sq.abs().float().sum().item()
+                else:
+                    self.total_sq_spikes += 0.0
+                    
+                _, spikes_v, _ = self.proposed_encoder(v)
+                self.total_v_spikes += spikes_v.abs().float().sum().item()
             else:
-                self.total_sq_spikes += 0.0
-                
-            _, spikes_v, _ = self.proposed_encoder(v)
-            self.total_v_spikes += spikes_v.abs().float().sum().item()
+                self.total_sq_spikes = 0.0
+                self.total_v_spikes = 0.0
             self.num_elements += x_flat.numel()
             self.num_samples += x_flat.shape[0]
             
@@ -419,10 +427,11 @@ class ProposedSoftmaxSPLA(nn.Module):
     Proposed Softmax using IEEE 754 Exponent-Guided Bit-Slice S-PLA.
     Includes active spike tracking for energy compilation.
     """
-    def __init__(self, timesteps=16, s_val=8.0):
+    def __init__(self, timesteps=16, s_val=8.0, track_spikes=False):
         super().__init__()
         self.timesteps = timesteps
         self.s_val = s_val
+        self.track_spikes = track_spikes
         self.encoder = IEEE754_based_encoder(timesteps=timesteps, s=math.ceil(math.log2(s_val)))
         
         # Track spikes
@@ -467,11 +476,16 @@ class ProposedSoftmaxSPLA(nn.Module):
         recip_broadcast = recip_sum.expand_as(exp_x)
         
         # Encode to capture spike statistics
-        _, spikes_exp, _ = self.encoder(exp_x)
-        _, spikes_recip, _ = self.encoder(recip_broadcast)
-        
+        if self.track_spikes:
+            _, spikes_exp, _ = self.encoder(exp_x)
+            _, spikes_recip, _ = self.encoder(recip_broadcast)
+            
+            with torch.no_grad():
+                self.total_spikes += spikes_exp.abs().float().sum().item() + spikes_recip.abs().float().sum().item()
+        else:
+            self.total_spikes = 0.0
+            
         with torch.no_grad():
-            self.total_spikes += spikes_exp.abs().float().sum().item() + spikes_recip.abs().float().sum().item()
             self.num_elements += exp_x.numel() + recip_broadcast.numel()
             
         out = exp_x * recip_broadcast
@@ -489,18 +503,24 @@ class SPLAActivationWrapper(nn.Module):
     SPLA Activation Wrapper driven by IEEE 754 encoder spikes.
     Tracks firing rate and spike totals to compute exact INT dynamic additions.
     """
-    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3, min_e_routing=-5):
+    def __init__(self, target_name='gelu', timesteps=16, scale_factor=3.0, prefix_k=3, min_e_routing=-5, track_spikes=False):
         super().__init__()
         self.spla = IEEE754_based_SPLA(target_name=target_name, timesteps=timesteps, scale_factor=scale_factor, prefix_k=prefix_k, min_e_routing=min_e_routing)
+        self.track_spikes = track_spikes
         self.total_spikes = 0.0
         self.num_elements = 0
         
     def forward(self, x):
-        out_step, spikes, _, _ = self.spla(x, return_details=True)
-        
+        if self.track_spikes:
+            out_step, spikes, _, _ = self.spla(x, return_details=True)
+            with torch.no_grad():
+                # Use absolute sum of binary spikes
+                self.total_spikes += spikes.abs().float().sum().item()
+        else:
+            out_step = self.spla(x, return_details=False)
+            self.total_spikes = 0.0
+            
         with torch.no_grad():
-            # Use absolute sum of binary spikes
-            self.total_spikes += spikes.abs().float().sum().item()
             self.num_elements += x.numel()
             
         return out_step
