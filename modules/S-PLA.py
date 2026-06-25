@@ -393,13 +393,11 @@ class SPLALayerNorm(nn.Module):
         # 4. Track Firing Rates for Energy Metrics (1D S-PLA)
         with torch.no_grad():
             if self.approx_square == 'pwl':
-                _, spikes_sq, _ = self.proposed_encoder(a)
-                self.total_sq_spikes += spikes_sq.abs().float().sum().item()
+                self.total_sq_spikes += self.proposed_encoder.spike_sum(a)
             else:
                 self.total_sq_spikes += 0.0
                 
-            _, spikes_v, _ = self.proposed_encoder(v)
-            self.total_v_spikes += spikes_v.abs().float().sum().item()
+            self.total_v_spikes += self.proposed_encoder.spike_sum(v)
             self.num_elements += x_flat.numel()
             self.num_samples += x_flat.shape[0]
             
@@ -466,12 +464,11 @@ class ProposedSoftmaxSPLA(nn.Module):
         # 3. Multiplier-Free Scale Shift-and-Add
         recip_broadcast = recip_sum.expand_as(exp_x)
         
-        # Encode to capture spike statistics
-        _, spikes_exp, _ = self.encoder(exp_x)
-        _, spikes_recip, _ = self.encoder(recip_broadcast)
-        
+        # Encode to capture spike statistics in a memory-efficient way
         with torch.no_grad():
-            self.total_spikes += spikes_exp.abs().float().sum().item() + spikes_recip.abs().float().sum().item()
+            sum_exp = self.encoder.spike_sum(exp_x)
+            sum_recip = self.encoder.spike_sum(recip_broadcast)
+            self.total_spikes += sum_exp + sum_recip
             self.num_elements += exp_x.numel() + recip_broadcast.numel()
             
         out = exp_x * recip_broadcast

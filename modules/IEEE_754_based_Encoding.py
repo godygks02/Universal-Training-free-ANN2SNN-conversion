@@ -67,9 +67,40 @@ class IEEE754_based_encoder(nn.Module):
         spikes = torch.where(t == 1, is_normal.unsqueeze(0), mantissa_bit)
         
         # Zero out spikes for absolute values smaller than the minimum precision or true zero
-        spikes = torch.where(x.unsqueeze(0).abs() < 1e-15, torch.zeros_like(spikes), spikes)
+        spikes = torch.where(x.unsqueeze(0).abs() < 1e-15, 0, spikes)
         
         return S, spikes.float(), e
+
+    def spike_sum(self, x):
+        """
+        Computes the sum of absolute values of spikes without storing the full temporal spike tensor.
+        This prevents CUDA out-of-memory errors on large tensors (e.g., attention weights).
+        """
+        device = x.device
+        x_contiguous = x.detach().contiguous()
+        x_int = x_contiguous.view(torch.int32)
+        
+        E = (x_int >> 23) & 0xFF  # Exponent field (8-bit)
+        M = (x_int & 0x7FFFFF).to(torch.int32)  # Force integer type
+        
+        is_normal = (E > 0).to(torch.int32)
+        abs_x = x.abs()
+        
+        total_sum = 0
+        
+        # We loop over timesteps to keep memory footprint minimal (only one spatial tensor at a time)
+        for t_val in range(1, self.timesteps + 1):
+            if t_val == 1:
+                spikes_t = is_normal
+            else:
+                shift_val = max(0, min(22, 24 - t_val))
+                spikes_t = (M >> shift_val) & 1
+            
+            # Apply thresholding
+            spikes_t = torch.where(abs_x < 1e-15, 0, spikes_t)
+            total_sum += spikes_t.sum().item()
+            
+        return float(total_sum)
 
     def decode(self, S, spikes, e):
         """
