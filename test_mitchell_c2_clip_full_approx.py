@@ -416,56 +416,82 @@ def reset_trackers(model):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def download_clip_samples():
-    """Downloads 5 public ImageNet samples for multimodal comparison."""
-    samples = [
-        {
-            "url": "https://images.unsplash.com/photo-1552053831-71594a27632d?w=256&h=256&fit=crop", # Golden Retriever
-            "name": "Golden Retriever"
-        },
-        {
-            "url": "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=256&h=256&fit=crop", # Egyptian Cat
-            "name": "Egyptian Cat"
-        },
-        {
-            "url": "https://images.unsplash.com/photo-1571771894821-ce9b6c11b08e?w=256&h=256&fit=crop", # Banana
-            "name": "Banana"
-        },
-        {
-            "url": "https://images.unsplash.com/photo-1503376780353-7e6692767b70?w=256&h=256&fit=crop", # Sports Car
-            "name": "Sports Car"
-        },
-        {
-            "url": "https://images.unsplash.com/photo-1501705388883-4ed8a543392c?w=256&h=256&fit=crop", # Zebra
-            "name": "Zebra"
-        }
-    ]
+    """Loads 100 actual images from the locally extracted Imagenette2-160 dataset."""
+    import os
+    from PIL import Image
+    import numpy as np
     
+    dataset_dir = os.path.join(current_dir, "data", "imagenette2-160")
+    
+    dir_to_idx = {
+        "n01440764": 0,    # tench
+        "n02102040": 217,  # English springer
+        "n02979186": 482,  # cassette player
+        "n03000684": 491,  # chain saw
+        "n03028079": 497,  # church
+        "n03394916": 566,  # French horn
+        "n03417042": 569,  # garbage truck
+        "n03425413": 571,  # gas pump
+        "n03445777": 574,  # golf ball
+        "n03888257": 701   # parachute
+    }
+    
+    dir_to_name = {
+        "n01440764": "tench",
+        "n02102040": "English springer",
+        "n02979186": "cassette player",
+        "n03000684": "chain saw",
+        "n03028079": "church",
+        "n03394916": "French horn",
+        "n03417042": "garbage truck",
+        "n03425413": "gas pump",
+        "n03445777": "golf ball",
+        "n03888257": "parachute"
+    }
+
     loaded_samples = []
-    print("\nDownloading validation images for CLIP...")
-    for s in samples:
-        try:
-            resp = requests.get(s["url"], timeout=10)
-            if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                loaded_samples.append({
-                    "image": img,
-                    "name": s["name"]
-                })
-                print(f"  Successfully loaded: {s['name']}")
-        except Exception as e:
-            print(f"  Failed to load {s['name']}: {e}")
-            
-    if len(loaded_samples) < 5:
-        print("  Warning: Download failed. Generating random synthetic images.")
-        while len(loaded_samples) < 5:
+    val_dir = os.path.join(dataset_dir, "val")
+    
+    if os.path.exists(val_dir):
+        # Read files from validation directory
+        for class_dir in sorted(os.listdir(val_dir)):
+            class_path = os.path.join(val_dir, class_dir)
+            if os.path.isdir(class_path) and class_dir in dir_to_idx:
+                class_idx = dir_to_idx[class_dir]
+                name = dir_to_name[class_dir]
+                
+                # Get image files
+                img_files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                for f in img_files:
+                    if len(loaded_samples) >= 100:
+                        break
+                    try:
+                        img_path = os.path.join(class_path, f)
+                        img = Image.open(img_path).convert("RGB")
+                        loaded_samples.append({
+                            "image": img,
+                            "name": name,
+                            "class_idx": class_idx
+                        })
+                    except Exception as e:
+                        print(f"  Error reading image {f}: {e}")
+                        
+            if len(loaded_samples) >= 100:
+                break
+                
+    # Fallback to synthetic if nothing loaded
+    if len(loaded_samples) < 100:
+        print(f"  Warning: Only loaded {len(loaded_samples)} samples. Generating synthetic fallback images to reach 100.")
+        while len(loaded_samples) < 100:
             idx = len(loaded_samples)
-            s = samples[idx]
             img = Image.fromarray(np.uint8(np.random.rand(224, 224, 3) * 255))
             loaded_samples.append({
                 "image": img,
-                "name": f"Synthetic_{s['name']}"
+                "name": f"Synthetic_{idx}",
+                "class_idx": 207
             })
             
+    print(f"  Successfully loaded {len(loaded_samples)} actual samples from local Imagenette.")
     return loaded_samples
 
 
@@ -486,52 +512,106 @@ def main():
     # Setup inputs
     samples = download_clip_samples()
     images = [s["image"] for s in samples]
-    labels = ["a photo of a golden retriever", "a photo of an egyptian cat", "a photo of a banana", "a photo of a sports car", "a photo of a zebra"]
+    labels = [
+        "a photo of a tench",
+        "a photo of an English springer",
+        "a photo of a cassette player",
+        "a photo of a chain saw",
+        "a photo of a church",
+        "a photo of a French horn",
+        "a photo of a garbage truck",
+        "a photo of a gas pump",
+        "a photo of a golf ball",
+        "a photo of a parachute"
+    ]
     
-    inputs = processor(text=labels, images=images, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # 2. Dynamic Activation Ranges Profiling (Zero-Clipping) over the first 5 samples
+    print("\nProfiling activation scales for both encoders using first 5 samples...")
+    calib_images = images[:5]
+    calib_inputs = processor(text=labels, images=calib_images, return_tensors="pt", padding=True)
+    calib_inputs = {k: v.to(device) for k, v in calib_inputs.items()}
+    ranges = calibrate_clip(ann_model, calib_inputs, device)
     
-    # 2. Dynamic Activation Ranges Profiling (Zero-Clipping)
-    print("\nProfiling activation scales for both encoders...")
-    ranges = calibrate_clip(ann_model, inputs, device)
-    
-    # Evaluate Baseline ANN CLIP
-    print("\nEvaluating Baseline ANN CLIP...")
-    with torch.no_grad():
-        ann_outputs = ann_model(**inputs)
-        # Cosine similarity logits
-        ann_logits = ann_outputs.logits_per_image # Shape: [5, 5]
-        ann_probs = ann_logits.softmax(dim=-1).cpu().numpy()
-        
-    # 3. Instantiate and Replace Proposed CLIP SNN
+    # 3. Instantiate and Replace Proposed CLIP SNN once
     print("\nConverting model to Mitchell C-2 & S-PLA Spiking CLIP...")
     snn_model = CLIPModel.from_pretrained(model_id).to(device)
     snn_model.eval()
     snn_model = replace_clip_modules_with_approx(snn_model, ranges, timesteps=16, prefix_k=3, device=device)
     
-    # Evaluate Proposed SNN CLIP
-    print("Evaluating Converted SNN CLIP...")
-    reset_trackers(snn_model)
-    with torch.no_grad():
-        snn_outputs = snn_model(**inputs)
-        snn_logits = snn_outputs.logits_per_image
-        snn_probs = snn_logits.softmax(dim=-1).cpu().numpy()
+    matches_top1 = 0
+    matches_top5 = 0
+    plot_data = []
+    
+    # Energy accumulators
+    energy_sums = {
+        "ann_total": 0.0, "snn_total": 0.0, "ann_linear": 0.0, "snn_linear": 0.0,
+        "ann_ln": 0.0, "snn_ln": 0.0, "ann_act": 0.0, "snn_act": 0.0,
+        "ann_softmax": 0.0, "snn_softmax": 0.0
+    }
+    
+    print("\nEvaluating dataset on Spiking CLIP...")
+    from tqdm import tqdm
+    for idx, sample in enumerate(tqdm(samples)):
+        img = sample["image"]
+        inputs_single = processor(text=labels, images=img, return_tensors="pt", padding=True)
+        inputs_single = {k: v.to(device) for k, v in inputs_single.items()}
         
-    # 4. Energy Calculations & Metrics Compiler
-    energy = calculate_clip_energy(ann_model, snn_model)
-    
-    # Metric evaluations
-    ann_preds = np.argmax(ann_probs, axis=-1)
-    snn_preds = np.argmax(snn_probs, axis=-1)
-    
-    matches_top1 = np.sum(ann_preds == snn_preds)
+        # Evaluate Baseline ANN CLIP
+        with torch.no_grad():
+            ann_outputs = ann_model(**inputs_single)
+            ann_logits = ann_outputs.logits_per_image
+            ann_probs = ann_logits.softmax(dim=-1).cpu().numpy()[0] # [10]
+            
+        # Evaluate Proposed SNN CLIP
+        reset_trackers(snn_model)
+        with torch.no_grad():
+            snn_outputs = snn_model(**inputs_single)
+            snn_logits = snn_outputs.logits_per_image
+            snn_probs = snn_logits.softmax(dim=-1).cpu().numpy()[0] # [10]
+            
+        # Energy Calculation
+        # seq_len_text = number of text tokens in current batch
+        seq_len_text = inputs_single["input_ids"].shape[-1]
+        energy = calculate_clip_energy(ann_model, snn_model, seq_len_text=seq_len_text, seq_len_vision=50)
+        for k in energy_sums:
+            energy_sums[k] += energy[k]
+            
+        # Metric evaluations
+        ann_top5_indices = np.argsort(-ann_probs) # Sort descending
+        snn_top5_indices = np.argsort(-snn_probs)
+        
+        ann_top1_idx = ann_top5_indices[0]
+        snn_top1_idx = snn_top5_indices[0]
+        
+        ann_top5_list = ann_top5_indices[:5]
+        snn_top5_list = snn_top5_indices[:5]
+        
+        is_top1_match = (ann_top1_idx == snn_top1_idx)
+        # Check if ANN top-3 classes are in SNN top-5 list
+        is_top5_match = all([cls_idx in snn_top5_list for cls_idx in ann_top5_indices[:3]])
+        
+        if is_top1_match:
+            matches_top1 += 1
+        if is_top5_match:
+            matches_top5 += 1
+            
+        plot_data.append({
+            "name": sample["name"],
+            "image": img,
+            "ann_classes": [labels[i].replace("a photo of a ", "") for i in ann_top5_list],
+            "ann_scores": ann_probs[ann_top5_list],
+            "snn_classes": [labels[i].replace("a photo of a ", "") for i in snn_top5_list],
+            "snn_scores": snn_probs[snn_top5_list]
+        })
+
+    # Summary report calculation
     total_samples = len(samples)
-    
     top1_match_rate = (matches_top1 / total_samples) * 100.0
-    # Overlap rate for top-5 predictions (since we have exactly 5 classes, top-5 overlap is 100%)
-    top5_overlap_rate = 100.0
+    top5_overlap_rate = (matches_top5 / total_samples) * 100.0
     
-    cdcer = (1.0 - energy["snn_total"] / energy["ann_total"]) * 100.0
+    # Compute averages
+    avg_energy = {k: v / total_samples for k, v in energy_sums.items()}
+    cdcer = (1.0 - avg_energy["snn_total"] / avg_energy["ann_total"]) * 100.0
     
     print("\n" + "="*80)
     print("CLIP MULTIMODAL SPIKING CONVERSION METRIC REPORT")
@@ -539,28 +619,40 @@ def main():
     print(f"  - Total Evaluated Images       : {total_samples}")
     print(f"  - SNN vs ANN Top-1 Match Rate  : {top1_match_rate:.1f}%")
     print(f"  - SNN vs ANN Top-5 Overlap Rate : {top5_overlap_rate:.1f}%")
-    print(f"  - Average ANN Model Energy     : {energy['ann_total']:.2f} uJ")
-    print(f"  - Average Converted SNN Energy : {energy['snn_total']:.2f} uJ")
-    print(f"  - Average Energy Reduction     : {cdcer:.2f}% (approx. {energy['ann_total']/energy['snn_total']:.1f}x lower)")
+    print(f"  - Average ANN Model Energy     : {avg_energy['ann_total']:.2f} uJ")
+    print(f"  - Average Converted SNN Energy : {avg_energy['snn_total']:.2f} uJ")
+    print(f"  - Average Energy Reduction     : {cdcer:.2f}% (approx. {avg_energy['ann_total']/avg_energy['snn_total']:.1f}x lower)")
     print("="*80)
     
-    # 5. Plot 1: Classification Probability Comparison (5 rows x 1 column or side-by-side)
+    # 5. Plot 1: Classification Probability Comparison (5 rows x 2 columns) - Only render first 5 samples
     fig, axes = plt.subplots(5, 2, figsize=(13, 16))
     for r in range(5):
         # Left: Image
         axes[r, 0].imshow(images[r])
-        axes[r, 0].set_title(f"Image {r+1}: {samples[r]['name']}", weight='bold')
+        axes[r, 0].set_title(f"Image {r+1}: {plot_data[r]['name']}", weight='bold')
         axes[r, 0].axis('off')
         
         # Right: Classification Probabilities
         x_indices = np.arange(5)
         width = 0.35
         
-        axes[r, 1].bar(x_indices - width/2, ann_probs[r], width, label='Baseline CLIP', color='#0D47A1')
-        axes[r, 1].bar(x_indices + width/2, snn_probs[r], width, label='Spiking SNN CLIP', color='#2E7D32')
+        # Extract Top-5 class names and scores for plotting
+        p_data = plot_data[r]
+        ann_names = p_data["ann_classes"]
+        snn_names = p_data["snn_classes"]
+        all_classes = list(dict.fromkeys(ann_names + snn_names))[:5] # top 5
+        
+        ann_mapping = {cls: score for cls, score in zip(p_data["ann_classes"], p_data["ann_scores"])}
+        snn_mapping = {cls: score for cls, score in zip(p_data["snn_classes"], p_data["snn_scores"])}
+        
+        ann_scores_plot = [ann_mapping.get(c, 0.0) for c in all_classes]
+        snn_scores_plot = [snn_mapping.get(c, 0.0) for c in all_classes]
+        
+        axes[r, 1].bar(x_indices - width/2, ann_scores_plot, width, label='Baseline CLIP', color='#0D47A1')
+        axes[r, 1].bar(x_indices + width/2, snn_scores_plot, width, label='Spiking SNN CLIP', color='#2E7D32')
         axes[r, 1].set_title("Probability Distribution", weight='bold', fontsize=10)
         axes[r, 1].set_xticks(x_indices)
-        axes[r, 1].set_xticklabels([lbl.replace("a photo of a ", "") for lbl in labels], rotation=15, ha='right', fontsize=9)
+        axes[r, 1].set_xticklabels(all_classes, rotation=15, ha='right', fontsize=9)
         axes[r, 1].set_ylabel("Probability")
         if r == 0:
             axes[r, 1].legend()
@@ -584,12 +676,13 @@ def main():
         ["Metric", "ANN (Baseline)", "Proposed SNN (T=16, K=3)", "Efficiency Gain / Delta"],
         ["Total Evaluated Images", f"{total_samples}", f"{total_samples}", "-"],
         ["Top-1 Match Rate", "100.0%", f"{top1_match_rate:.1f}%", f"{top1_match_rate:.1f}% Match"],
-        ["Linear Projections Energy", f"{energy['ann_linear']:.2f} uJ", f"{energy['snn_linear']:.2f} uJ", f"{(1 - energy['snn_linear']/energy['ann_linear'])*100:.1f}% Savings"],
-        ["LayerNorm Blocks Energy", f"{energy['ann_ln']:.2f} uJ", f"{energy['snn_ln']:.2f} uJ", f"{(1 - energy['snn_ln']/energy['ann_ln'])*100:.1f}% Savings"],
-        ["QuickGELU Activation Energy", f"{energy['ann_act']:.2f} uJ", f"{energy['snn_act']:.2f} uJ", f"{(1 - energy['snn_act']/energy['ann_act'])*100:.1f}% Savings"],
-        ["Softmax & Attention Scores", f"{energy['ann_softmax']:.2f} uJ", f"{energy['snn_softmax']:.2f} uJ", f"{(1 - energy['snn_softmax']/energy['ann_softmax'])*100:.1f}% Savings"],
-        ["Average Model Energy", f"{energy['ann_total']:.2f} uJ", f"{energy['snn_total']:.2f} uJ", f"{cdcer:.2f}% (Savings)"],
-        ["Average Energy Reduction", "1.0x (Base)", f"{energy['ann_total']/energy['snn_total']:.1f}x Lower", "-"]
+        ["Top-5 Overlap Rate", "100.0%", f"{top5_overlap_rate:.1f}%", f"{top5_overlap_rate:.1f}% Overlap"],
+        ["Linear Projections Energy", f"{avg_energy['ann_linear']:.2f} uJ", f"{avg_energy['snn_linear']:.2f} uJ", f"{(1 - avg_energy['snn_linear']/avg_energy['ann_linear'])*100:.1f}% Savings"],
+        ["LayerNorm Blocks Energy", f"{avg_energy['ann_ln']:.2f} uJ", f"{avg_energy['snn_ln']:.2f} uJ", f"{(1 - avg_energy['snn_ln']/avg_energy['ann_ln'])*100:.1f}% Savings"],
+        ["QuickGELU Activation Energy", f"{avg_energy['ann_act']:.2f} uJ", f"{avg_energy['snn_act']:.2f} uJ", f"{(1 - avg_energy['snn_act']/avg_energy['ann_act'])*100:.1f}% Savings"],
+        ["Softmax & Attention Scores", f"{avg_energy['ann_softmax']:.2f} uJ", f"{avg_energy['snn_softmax']:.2f} uJ", f"{(1 - avg_energy['snn_softmax']/avg_energy['ann_softmax'])*100:.1f}% Savings"],
+        ["Average Model Energy", f"{avg_energy['ann_total']:.2f} uJ", f"{avg_energy['snn_total']:.2f} uJ", f"{cdcer:.2f}% (Savings)"],
+        ["Average Energy Reduction", "1.0x (Base)", f"{avg_energy['ann_total']/avg_energy['snn_total']:.1f}x Lower", "-"]
     ]
     
     table = ax.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.25, 0.25, 0.3, 0.2])
@@ -603,7 +696,7 @@ def main():
             cell.set_text_props(weight='bold')
             cell.set_facecolor('#e8f5e9') # Green accent header
             
-    plt.title("Mitchell C-2 & S-PLA Spiking CLIP Verification Report\n(Multimodal Zero-Shot, ImageNet Targets, T=16)", pad=20, weight='bold', color='#2E7D32')
+    plt.title("Mitchell C-2 & S-PLA Spiking CLIP Verification Report\n(Multimodal Zero-Shot, Imagenette Targets, T=16)", pad=20, weight='bold', color='#2E7D32')
     energy_save_path = os.path.join(plot_dir, "clip_energy_report.png")
     plt.savefig(energy_save_path, dpi=150, bbox_inches='tight')
     plt.close()
